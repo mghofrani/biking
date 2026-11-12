@@ -1,0 +1,1054 @@
+import { buildRideGraph, dijkstra, pathPieces, haversine } from './ridegraph.js';
+import { buildTrainGraph, trainSearch, trainJourney, journeyStats } from './trains.js';
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+const RANGES = [[10, 20], [20, 30], [30, 45], [45, 80]];
+const DEFAULT_RANGE = 1;
+// How long the train trip out to the start of the ride takes (minutes). Every ride starts with one.
+const OUT_BANDS = [[4, 25, 'Nearby'], [25, 45, 'Suburbs'], [45, 80, 'Far out']];
+const DEFAULT_OUT = 1;
+const DEFAULT_FROM = 'Flinders Street';
+const RIDE_KMH = 15;          // relaxed average incl. stops
+const MAX_TRAIN_MIN = 90;     // each way
+const N_SUGGEST = 6;
+const SOURCE_SITE = 'https://melbournebiketrails.yolasite.com/';
+
+const MOBILE = window.matchMedia('(max-width: 760px)');
+const DARK = window.matchMedia('(prefers-color-scheme: dark)');
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
+};
+
+const ICON = {
+  train: '<svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="13" rx="3"/><path d="M5 10h14M8.5 21l2-5M15.5 21l-2-5"/><path d="M9 13h.01M15 13h.01"/></svg>',
+  bike: '<svg viewBox="0 0 24 24"><circle cx="5.5" cy="16" r="3.8"/><circle cx="18.5" cy="16" r="3.8"/><path d="M5.5 16l4-7.5h6l3 7.5M9.5 8.5l3 7.5h-7M15.5 8.5l-3 7.5M8 5.5h3"/></svg>',
+  walk: '<svg viewBox="0 0 24 24"><circle cx="13" cy="4.5" r="1.8"/><path d="M10 21l2-6 3 3v3M8 12l3-4 3 1 2 3M12 15l-1-6"/></svg>',
+  home: '<svg viewBox="0 0 24 24"><path d="M4 11.5L12 5l8 6.5V20H4z"/><path d="M10 20v-5h4v5"/></svg>',
+  flag: '<svg viewBox="0 0 24 24"><path d="M6 21V4M6 4h11l-2.5 4L17 12H6"/></svg>',
+};
+
+const fmtDur = (m) => {
+  m = Math.round(m);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h} h ${String(r).padStart(2, '0')} min` : `${h} h`;
+};
+const fmtKm = (km) => (km >= 10 ? Math.round(km) : Math.round(km * 10) / 10);
+const dayNumber = () => Math.floor((Date.now() - new Date().getTimezoneOffset() * 60000) / 864e5);
+function rnd(seed, a, b) { // deterministic 0..1
+  let h = Math.imul(seed ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(a + 1, 0xc2b2ae35) ^ Math.imul(b + 7, 0x27d4eb2f);
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d); h ^= h >>> 12; h = Math.imul(h, 0x297a2d39); h ^= h >>> 15;
+  return (h >>> 0) / 4294967296;
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let trails, net, rides, g, tg;
+const state = { from: 0, to: null, range: DEFAULT_RANGE, out: DEFAULT_OUT, seed: dayNumber(), shuffled: false, trail: null, list: [], sel: -1, shared: null, picking: null };
+const rideCache = new Map();
+
+// ---------------------------------------------------------------------------
+// Map
+// ---------------------------------------------------------------------------
+const map = L.map('map', { zoomControl: false, minZoom: 9, maxZoom: 18, attributionControl: true })
+  .setView([-37.83, 145.03], 11);
+if (!MOBILE.matches) L.control.zoom({ position: 'bottomright' }).addTo(map);
+map.attributionControl.setPrefix(false);
+
+// OpenStreetMap tiles, recoloured in the browser: parks, woods and grass stay green and
+// water stays blue, while roads, buildings and labels turn grey so the orange trails and
+// the coloured train lines stand out. In the dark theme the greys are inverted.
+const band = (h, lo, hi, soft) => (h < lo - soft || h > hi + soft ? 0 : h < lo ? (h - lo + soft) / soft : h > hi ? (hi + soft - h) / soft : 1);
+function recolour(px, dark) {
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i], g = px[i + 1], b = px[i + 2];
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), c = max - min;
+    const grey = 0.299 * r + 0.587 * g + 0.114 * b;
+    let keep = 0;
+    if (c > 10) {
+      let h = max === r ? ((g - b) / c) % 6 : max === g ? (b - r) / c + 2 : (r - g) / c + 4;
+      h *= 60; if (h < 0) h += 360;
+      // Greens (parks, woods, grass, sports fields) and blues (rivers, lakes, sea, water labels).
+      // Yellows (secondary roads, farmland), oranges and pinks (main roads) are left out.
+      keep = Math.max(band(h, 80, 170, 12), band(h, 178, 235, 10));
+    }
+    let base, k;
+    if (dark) { base = (0.9 * (255 - grey - 128) + 128) * 0.82; k = 0.75 * keep; }
+    else { base = 0.88 * (grey - 128) + 136; k = 1.25 * keep; }
+    px[i] = base + (r - grey) * k;
+    px[i + 1] = base + (g - grey) * k;
+    px[i + 2] = base + (b - grey) * k;
+  }
+}
+const NatureTiles = L.TileLayer.extend({
+  createTile(coords, done) {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 256;
+    canvas.complete = false; // Leaflet checks this when cancelling tiles on zoom
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, 256, 256);
+      try {
+        const data = ctx.getImageData(0, 0, 256, 256);
+        recolour(data.data, isDark());
+        ctx.putImageData(data, 0, 0);
+      } catch { /* image not readable: show it unchanged */ }
+      canvas.complete = true;
+      done(null, canvas);
+    };
+    img.onerror = (e) => { canvas.complete = true; done(e, canvas); };
+    img.src = this.getTileUrl(coords);
+    return canvas;
+  },
+});
+const base = new NatureTiles('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+}).addTo(map);
+
+// Stacked canvases only deliver taps to the top one, so: everything tappable (trails +
+// stations) shares one canvas, and the decorative canvases let taps fall through.
+for (const [name, z, clickThrough] of [['trains', 410, true], ['network', 420, false], ['trip', 450, true], ['movers', 630, true], ['pins', 640, false]]) {
+  const pane = map.createPane(name);
+  pane.style.zIndex = z;
+  if (clickThrough) pane.style.pointerEvents = 'none';
+}
+const R = (pane) => L.canvas({ pane, tolerance: 9, padding: 0.4 });
+const rTrains = R('trains'), rTrails = R('network'), rStations = rTrails, rTrip = R('trip');
+
+const trainsLayer = L.layerGroup().addTo(map);
+const trailsLayer = L.layerGroup().addTo(map);
+const stationsLayer = L.layerGroup().addTo(map);
+const tripLayer = L.layerGroup().addTo(map);
+const trainLines = [], trailLines = [], trailHalos = [], stationDots = [];
+
+function drawNetwork() {
+  const halo = cssVar('--panel') || '#fff';
+  // Train lines: one stroke per line colour, side by side where lines share track.
+  const colourOrder = [...new Set(net.routes.map((r) => r.color))];
+  net.segs.forEach((sg) => {
+    const colours = [...new Set(sg.r.map((r) => net.routes[r].color))].sort((a, b) => colourOrder.indexOf(a) - colourOrder.indexOf(b));
+    const k = colours.length, w = 3.2;
+    colours.forEach((c, i) => {
+      const line = L.polyline(sg.g, {
+        renderer: rTrains, color: c, weight: w, opacity: 0.9, offset: (i - (k - 1) / 2) * w, interactive: false,
+      }).addTo(trainsLayer);
+      trainLines.push(line);
+    });
+  });
+
+  trails.forEach((t, i) => {
+    trailHalos.push(L.polyline(t.coords, { renderer: rTrails, color: halo, weight: 7.5, opacity: 0.9, interactive: false }).addTo(trailsLayer));
+  });
+  trails.forEach((t, i) => {
+    const line = L.polyline(t.coords, { renderer: rTrails, color: cssVar('--trail'), weight: 3.6, opacity: 1, lineCap: 'round' })
+      .bindPopup(() => trailPopup(i), { maxWidth: 260 })
+      .addTo(trailsLayer);
+    line.on('mouseover', () => line.setStyle({ weight: 6 }));
+    line.on('mouseout', () => line.setStyle({ weight: 3.6 }));
+    trailLines.push(line);
+  });
+
+  net.stations.forEach((s, i) => {
+    const groups = new Set(s.routes.map((r) => net.routes[r].color)).size;
+    const dot = L.circleMarker(s.ll, {
+      renderer: rStations, radius: 3, weight: groups > 1 ? 2.2 : 1.6, color: '#1d232a', fillColor: '#fff', fillOpacity: 1,
+    }).bindPopup(() => stationPopup(i), { maxWidth: 260 }).addTo(stationsLayer);
+    dot.big = groups > 1;
+    stationDots.push(dot);
+  });
+  sizeStations();
+}
+
+function sizeStations() {
+  const z = map.getZoom();
+  const r = z < 11 ? 2.2 : z < 12 ? 3 : z < 14 ? 4 : 5.5;
+  stationDots.forEach((d) => d.setRadius(d.big ? r + 1.2 : r));
+}
+map.on('zoomend', sizeStations);
+
+function dimNetwork(dim) {
+  trainLines.forEach((l) => l.setStyle({ opacity: dim ? 0.28 : 0.9 }));
+  trailLines.forEach((l) => l.setStyle({ opacity: dim ? 0.4 : 1 }));
+  trailHalos.forEach((l) => l.setStyle({ opacity: dim ? 0.35 : 0.9 }));
+  stationDots.forEach((d) => d.setStyle({ opacity: dim ? 0.5 : 1, fillOpacity: dim ? 0.6 : 1 }));
+}
+
+function restyle() {
+  const halo = cssVar('--panel') || '#fff';
+  trailHalos.forEach((l) => l.setStyle({ color: halo }));
+  trailLines.forEach((l) => l.setStyle({ color: cssVar('--trail') }));
+  base.redraw(); // re-colour the map for the new theme (tiles come from the browser cache)
+  if (state.sel >= 0) drawTrip(state.list[state.sel], false);
+}
+DARK.addEventListener?.('change', () => { restyle(); renderThemeBtn(); });
+
+// Light / dark switch. The page starts light (set in index.html) unless dark was chosen before.
+const SUN = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+const MOON = '<svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></svg>';
+function isDark() {
+  const t = document.documentElement.dataset.theme;
+  return t ? t === 'dark' : DARK.matches;
+}
+function renderThemeBtn() {
+  const btn = $('themeBtn');
+  const label = isDark() ? 'Switch to light theme' : 'Switch to dark theme';
+  btn.innerHTML = isDark() ? SUN : MOON;
+  btn.setAttribute('aria-label', label);
+  btn.title = label;
+}
+$('themeBtn').addEventListener('click', () => {
+  const next = isDark() ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  store.set('tt.theme', next);
+  renderThemeBtn();
+  restyle();
+});
+renderThemeBtn();
+
+// Legend + layer toggles
+const Legend = L.Control.extend({
+  options: { position: 'topright' },
+  onAdd() {
+    const div = L.DomUtil.create('div', 'legend');
+    div.innerHTML = `
+      <label><input type="checkbox" checked data-layer="trails"><span class="swatch trail"></span>Bike trails</label>
+      <label><input type="checkbox" checked data-layer="trains"><span class="swatch train"></span>Train lines</label>`;
+    L.DomEvent.disableClickPropagation(div);
+    div.addEventListener('change', (e) => {
+      const which = e.target.dataset.layer;
+      const layers = which === 'trails' ? [trailsLayer] : [trainsLayer, stationsLayer];
+      layers.forEach((l) => (e.target.checked ? l.addTo(map) : map.removeLayer(l)));
+    });
+    return div;
+  },
+});
+new Legend().addTo(map);
+
+// ---------------------------------------------------------------------------
+// Your location: a blue dot that follows you, with a ring showing GPS accuracy.
+// Browsers only share location with secure (https or localhost) pages.
+// ---------------------------------------------------------------------------
+function toast(msg, ms = 4500) {
+  let el = document.querySelector('.toast');
+  if (!el) { el = document.createElement('div'); el.className = 'toast'; el.setAttribute('role', 'status'); document.body.appendChild(el); }
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+const me = {
+  watch: null, wanted: false, fix: null, centred: false,
+  dot: null, ring: null, btn: null,
+};
+const LOCATE_ICON = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5" class="core"/><circle cx="12" cy="12" r="7.5"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/></svg>';
+
+function setLocateState(s) { if (me.btn) me.btn.dataset.state = s; } // off | searching | on
+
+function showFix(pos) {
+  const { latitude: la, longitude: lo, accuracy } = pos.coords;
+  me.fix = { ll: [la, lo], accuracy, at: Date.now() };
+  if (!me.dot) {
+    me.ring = L.circle([la, lo], { renderer: rTrip, radius: accuracy, color: '#1a73e8', weight: 1, opacity: 0.35, fillColor: '#1a73e8', fillOpacity: 0.12, interactive: false }).addTo(map);
+    me.dot = L.marker([la, lo], {
+      pane: 'pins', keyboard: false, interactive: false,
+      icon: L.divIcon({ className: '', html: '<div class="me-dot"></div>', iconSize: [22, 22], iconAnchor: [11, 11] }),
+    }).addTo(map);
+  } else {
+    me.ring.setLatLng([la, lo]).setRadius(accuracy);
+    me.dot.setLatLng([la, lo]);
+  }
+  setLocateState('on');
+  if (!me.centred) { me.centred = true; centreOnMe(); }
+}
+
+function centreOnMe() {
+  if (!me.fix) return;
+  const zoom = Math.max(map.getZoom(), 15);
+  let target = L.latLng(me.fix.ll);
+  if (MOBILE.matches) {
+    // Centre the dot in the part of the map not covered by the bottom sheet.
+    const covered = panel.offsetHeight - sheetY(panel.dataset.state);
+    const p = map.project(target, zoom).add([0, covered / 2]);
+    target = map.unproject(p, zoom);
+  }
+  map.flyTo(target, zoom, { duration: 0.8 });
+}
+
+function startWatch() {
+  if (me.watch != null) return;
+  me.watch = navigator.geolocation.watchPosition(showFix, (err) => {
+    stopWatch();
+    me.wanted = false;
+    setLocateState('off');
+    if (err.code === 1) toast('Location is blocked for this site. You can allow it in your browser’s site settings.');
+    else toast('Couldn’t find your location. Try again outdoors or with GPS turned on.');
+  }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+}
+function stopWatch() {
+  if (me.watch != null) navigator.geolocation.clearWatch(me.watch);
+  me.watch = null;
+}
+
+/** centre: move the map to you once the first position arrives. */
+function startLocating({ centre = true } = {}) {
+  if (!('geolocation' in navigator)) { toast('This browser can’t share your location.'); return; }
+  if (!window.isSecureContext) {
+    toast('Your location only works on a secure (https) page, e.g. the published site on github.io.');
+    return;
+  }
+  me.wanted = true;
+  me.centred = !centre;
+  if (!me.fix) setLocateState('searching');
+  startWatch();
+}
+
+const Locate = L.Control.extend({
+  options: { position: 'topright' },
+  onAdd() {
+    const btn = L.DomUtil.create('button', 'locate-btn');
+    btn.type = 'button';
+    btn.innerHTML = LOCATE_ICON;
+    btn.title = 'Show my location';
+    btn.setAttribute('aria-label', 'Show my location');
+    btn.dataset.state = 'off';
+    L.DomEvent.disableClickPropagation(btn);
+    btn.addEventListener('click', () => (me.fix && me.wanted ? centreOnMe() : startLocating()));
+    me.btn = btn;
+    return btn;
+  },
+});
+new Locate().addTo(map);
+
+// Save battery: stop GPS while the app is in the background, resume when it comes back.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopWatch();
+  else if (me.wanted) startWatch();
+});
+// If location was allowed before, show the dot straight away (no prompt, no map jump).
+if (window.isSecureContext && navigator.permissions?.query) {
+  navigator.permissions.query({ name: 'geolocation' })
+    .then((p) => { if (p.state === 'granted') startLocating({ centre: false }); })
+    .catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Popups
+// ---------------------------------------------------------------------------
+const lineChips = (routeIdxs, max = 4) => {
+  const names = [...new Map(routeIdxs.map((r) => [net.routes[r].name, net.routes[r]])).values()];
+  const shown = names.slice(0, max).map((r) => `<span class="line-chip" style="background:${r.color};color:${r.text}">${esc(r.name)}</span>`);
+  if (names.length > max) shown.push(`<span class="line-chip" style="background:var(--soft)">+${names.length - max}</span>`);
+  return shown.join('');
+};
+
+function trailPopup(i) {
+  const t = trails[i];
+  const bits = [`${t.km} km`, t.mins ? `~${fmtDur(t.mins)}` : null, t.grade].filter(Boolean).join(' · ');
+  return `<div class="pop">
+    <h4>${esc(t.name)}</h4>
+    <div class="meta">${esc(bits)}</div>
+    <div class="acts">
+      <button class="btn primary" data-act="trail" data-i="${i}">Rides on this trail</button>
+      <a class="btn" href="${SOURCE_SITE}" target="_blank" rel="noopener">Trail guide ↗</a>
+    </div></div>`;
+}
+
+function stationPopup(i) {
+  const s = net.stations[i];
+  return `<div class="pop">
+    <h4>${esc(s.name)}</h4>
+    <div class="meta">${lineChips(s.routes, 6)}</div>
+    <div class="acts">
+      <button class="btn primary" data-act="from" data-i="${i}">Start here</button>
+      <button class="btn" data-act="to" data-i="${i}">Finish here</button>
+      ${s.url ? `<a class="btn" href="${esc(s.url)}" target="_blank" rel="noopener">Station info ↗</a>` : ''}
+    </div></div>`;
+}
+
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+  const i = +b.dataset.i;
+  map.closePopup();
+  if (b.dataset.act === 'from') { state.from = i; syncSelects(); refresh(); }
+  if (b.dataset.act === 'to') { state.to = i === state.from ? null : i; syncSelects(); refresh(); }
+  if (b.dataset.act === 'trail') { state.trail = i; refresh(); }
+  if (b.dataset.act === 'clear-trail') { state.trail = null; refresh(); }
+  if (b.dataset.act === 'gpx') downloadGpx(state.list[state.sel]);
+});
+
+// ---------------------------------------------------------------------------
+// Suggestions
+// ---------------------------------------------------------------------------
+function makeCandidate(rideIdx, s, e, out, back, score = 0) {
+  const [a, , km10, road10, seq] = rides[rideIdx];
+  return {
+    ride: rideIdx, s, e, score,
+    km: km10 / 10, road: road10 / 10,
+    seq: s === a ? seq : seq.slice().reverse(),
+    t1: out.minutes[s], t2: back.minutes[e],
+  };
+}
+
+function suggest() {
+  const from = state.from, to = state.to ?? state.from;
+  const [lo, hi] = RANGES[state.range];
+  const mid = (lo + hi) / 2;
+  const [olo, ohi] = OUT_BANDS[state.out];
+  const omid = (olo + ohi) / 2;
+  const out = trainSearch(tg, from);
+  const back = to === from ? out : trainSearch(tg, to);
+  const cands = [];
+  rides.forEach(([a, b, km10, road10, seq], i) => {
+    const km = km10 / 10;
+    if (km < lo || km > hi) return;
+    if (state.trail != null && !seq.some((q) => q[0] === state.trail)) return;
+    for (const [s, e] of [[a, b], [b, a]]) {
+      const t1 = out.minutes[s], t2 = back.minutes[e];
+      // Day shape: train out (in the chosen time band) → ride → train home.
+      if (!(t1 >= olo && t1 <= ohi && t2 <= MAX_TRAIN_MIN)) continue;
+      // A ride that ends a short walk from home is a duplicate of the one that ends at home.
+      if (out.walkOnly[s] || back.walkOnly[e]) continue;
+      // Mild preference for a shorter trip home, little road riding, and distances mid-band.
+      const score = t2 * 0.4 + road10 * 1.5 + Math.abs(km - mid) * 0.5 + Math.abs(t1 - omid) * 0.3 + rnd(state.seed, s, e) * 40;
+      cands.push([score, i, s, e]);
+    }
+  });
+  cands.sort((x, y) => x[0] - y[0]);
+
+  // Keep the list varied: different trails, different start stations, and mostly
+  // "train → ride → train" days (at most two rides that finish right at your destination).
+  const picked = [], sets = [], perStart = new Map(), pairs = new Set();
+  let rideHome = 0;
+  for (const [score, i, s, e] of cands) {
+    if (picked.length >= N_SUGGEST) break;
+    const pairKey = Math.min(s, e) + '|' + Math.max(s, e);
+    if (pairs.has(pairKey) || (perStart.get(s) || 0) >= 2) continue;
+    if (e === to && rideHome >= 2) continue;
+    const set = new Set(rides[i][4].map((q) => q[0]));
+    const similar = sets.some((o) => {
+      let inter = 0; for (const x of set) if (o.has(x)) inter++;
+      return inter / (set.size + o.size - inter) >= 0.5;
+    });
+    if (similar) continue;
+    picked.push(makeCandidate(i, s, e, out, back, score));
+    sets.push(set); pairs.add(pairKey); perStart.set(s, (perStart.get(s) || 0) + 1);
+    if (e === to) rideHome++;
+  }
+
+  // A ride opened from a shared link always shows first.
+  if (state.shared) {
+    const { s, e } = state.shared;
+    const i = rides.findIndex(([a, b]) => (a === s && b === e) || (a === e && b === s));
+    const already = picked.findIndex((c) => c.s === s && c.e === e);
+    if (already >= 0) picked.unshift(...picked.splice(already, 1));
+    else if (i >= 0) picked.unshift(Object.assign(makeCandidate(i, s, e, out, back), { sharedLink: true }));
+    state.shared = null;
+  }
+
+  for (const c of picked) {
+    c.out = trainJourney(tg, net, out, c.s) || [];
+    const fromEnd = trainSearch(tg, c.e);
+    c.back = trainJourney(tg, net, fromEnd, to) || [];
+    c.outStats = journeyStats(c.out);
+    c.backStats = journeyStats(c.back);
+    c.rideMins = (c.km / RIDE_KMH) * 60;
+    c.total = c.outStats.mins + c.rideMins + c.backStats.mins;
+  }
+  return picked;
+}
+
+// ---------------------------------------------------------------------------
+// Cards
+// ---------------------------------------------------------------------------
+const stName = (i) => net.stations[i].name;
+
+function trainStep(legs, stats, from, to, isReturn) {
+  if (!legs.length) {
+    return `<li class="step"><span class="ico">${ICON.home}</span><div class="step-main">
+      <div class="step-title">${isReturn ? `Finish at ${esc(stName(to))}` : `Start riding at ${esc(stName(from))}`}</div>
+      <div class="step-sub">No train needed</div></div></li>`;
+  }
+  const parts = legs.map((l) => (l.type === 'walk'
+    ? `<span>walk to ${esc(stName(l.to))}</span>`
+    : lineChips(l.routes, 3)));
+  const changes = legs.filter((l) => l.type === 'train').slice(1).map((l) => stName(l.from));
+  const changeTxt = changes.length ? ` · change at ${esc(changes.join(', '))}` : '';
+  const walking = legs.every((l) => l.type === 'walk');
+  return `<li class="step"><span class="ico">${walking ? ICON.walk : ICON.train}</span><div class="step-main">
+    <div class="step-title">${walking ? 'Walk' : 'Train'} ${esc(stName(from))} → ${esc(stName(to))}</div>
+    <div class="step-sub">${parts.join(' <span class="sep">then</span> ')} <span class="nowrap">${fmtDur(stats.mins)}${changeTxt}</span></div></div></li>`;
+}
+
+function rideStep(c) {
+  const chain = c.seq.map(([t]) => `<span>${esc(trails[t].name)}</span>`).join('<span class="sep">›</span>');
+  const road = c.road >= 0.1 ? ` · ${fmtKm(c.road)} km on streets` : '';
+  return `<li class="step ride"><span class="ico">${ICON.bike}</span><div class="step-main">
+    <div class="step-title">Ride ${fmtKm(c.km)} km</div>
+    <div class="step-sub"><span class="trail-chain">${chain}</span></div>
+    <div class="step-sub">about ${fmtDur(c.rideMins)}${road}</div></div></li>`;
+}
+
+function renderCards() {
+  const list = state.list;
+  const [lo, hi] = RANGES[state.range];
+  $('resultsTitle').textContent = list.length ? `${list.length} ride ideas · ${lo}–${hi} km` : 'Ride ideas';
+  const fb = $('filterBar');
+  fb.hidden = state.trail == null;
+  if (state.trail != null) {
+    fb.innerHTML = `Only rides using <span class="filter-chip">${esc(trails[state.trail].name)}
+      <button data-act="clear-trail" aria-label="Clear trail filter">×</button></span>`;
+  }
+  const to = state.to ?? state.from;
+  if (!list.length) {
+    const [olo, ohi] = OUT_BANDS[state.out];
+    $('cards').innerHTML = `<li class="empty">No ${lo}–${hi} km rides start ${olo}–${ohi} min by train from
+      ${esc(stName(state.from))}${state.trail != null ? ' on this trail' : ''}. Try another train time or distance${state.trail != null ? ', or clear the trail filter' : ''}.</li>`;
+    renderPeek();
+    return;
+  }
+  $('cards').innerHTML = list.map((c, i) => {
+    const pill = c.sharedLink ? 'Shared ride' : i === 0 && !state.shuffled && state.trail == null ? "Today's pick" : '';
+    return `<li class="card" data-i="${i}" tabindex="0" role="button" aria-current="${i === state.sel}">
+      <div class="card-top">
+        <span class="km">${fmtKm(c.km)}<small> km</small></span>
+        <span class="day">day out ≈ ${fmtDur(c.total)}</span>
+        ${pill ? `<span class="pill">${pill}</span>` : ''}
+      </div>
+      <h3>${esc(stName(c.s))} → ${esc(stName(c.e))}</h3>
+      <ol class="steps">
+        ${trainStep(c.out, c.outStats, state.from, c.s, false)}
+        ${rideStep(c)}
+        ${trainStep(c.back, c.backStats, c.e, to, true)}
+      </ol>
+      <div class="card-actions">
+        <a class="btn" href="${gmapsUrl(c)}" target="_blank" rel="noopener">Open ride in Google Maps ↗</a>
+        <button class="btn" data-act="gpx">Download GPX</button>
+      </div>
+    </li>`;
+  }).join('');
+  renderPeek();
+}
+
+$('cards').addEventListener('click', (e) => {
+  if (e.target.closest('a, button')) return;
+  const card = e.target.closest('.card');
+  if (!card) return;
+  const i = +card.dataset.i;
+  select(i === state.sel ? -1 : i, { fromList: true });
+});
+$('cards').addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.classList.contains('card')) {
+    e.preventDefault(); e.target.click();
+  }
+});
+
+function renderPeek() {
+  const c = state.list[state.sel];
+  const n = state.list.length;
+  $('peekPrev').disabled = $('peekNext').disabled = n < 2;
+  $('peekBody').innerHTML = c
+    ? `<div class="peek-title"><span class="km">${fmtKm(c.km)}<small> km</small></span> ${esc(stName(c.s))} → ${esc(stName(c.e))}</div>
+       <div class="peek-sub">${state.sel + 1} of ${n} · day out ≈ ${fmtDur(c.total)} · tap for details</div>`
+    : `<div class="peek-title">${n ? `${n} ride ideas` : 'No rides found'}</div><div class="peek-sub">Tap to choose a ride</div>`;
+}
+$('peekPrev').addEventListener('click', () => step(-1));
+$('peekNext').addEventListener('click', () => step(1));
+function step(d) {
+  const n = state.list.length;
+  if (!n) return;
+  select(((state.sel < 0 ? 0 : state.sel + d) % n + n) % n);
+}
+
+// ---------------------------------------------------------------------------
+// Selected trip on the map
+// ---------------------------------------------------------------------------
+function rideResult(s) {
+  if (!rideCache.has(s)) rideCache.set(s, dijkstra(g, g.stationNode(s), 80 * 1000 * 1.6));
+  return rideCache.get(s);
+}
+const ridePieces = (c) => pathPieces(g, rideResult(c.s), g.stationNode(c.e));
+
+function legCoords(leg) {
+  if (leg.type === 'walk') return [net.stations[leg.from].ll, net.stations[leg.to].ll];
+  const out = [];
+  for (const { seg, reverse } of leg.segs) {
+    let pts = net.segs[seg].g;
+    if (reverse) pts = pts.slice().reverse();
+    out.push(...(out.length ? pts.slice(1) : pts));
+  }
+  return out;
+}
+
+function pin(ll, kind, label, icon) {
+  const m = L.marker(ll, {
+    pane: 'pins', keyboard: false,
+    icon: L.divIcon({ className: '', html: `<div class="pin ${kind}">${icon}</div>`, iconSize: [30, 30], iconAnchor: [15, 15] }),
+  });
+  m.bindTooltip(esc(label), { permanent: true, direction: 'top', offset: [0, -16], className: 'pin-label' });
+  return m.addTo(tripLayer);
+}
+
+// A train leg drawn as railway track: two rails with sleepers across them, in the line's colour.
+function drawRailway(pts, color, halo) {
+  const o = { renderer: rTrip, interactive: false, opacity: 1, lineJoin: 'round' };
+  L.polyline(pts, { ...o, color: halo, weight: 17, opacity: 0.92 }).addTo(tripLayer);
+  L.polyline(pts, { ...o, color, weight: 13, dashArray: '2.5 6', lineCap: 'butt' }).addTo(tripLayer); // sleepers
+  L.polyline(pts, { ...o, color, weight: 2.4, offset: -4 }).addTo(tripLayer);                          // rail
+  L.polyline(pts, { ...o, color, weight: 2.4, offset: 4 }).addTo(tripLayer);                           // rail
+}
+
+// ---------------------------------------------------------------------------
+// Moving icons: trains and bikes travel along each leg in the direction of the trip.
+// ---------------------------------------------------------------------------
+const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)');
+let movers = [];
+let moverFrame = 0;
+
+function prepPath(p) {
+  const cum = [0];
+  for (let i = 1; i < p.coords.length; i++) cum.push(cum[i - 1] + haversine(...p.coords[i - 1], ...p.coords[i]));
+  const km = cum[cum.length - 1] / 1000;
+  // Seconds for one pass: longer legs take longer, within limits so short hops stay readable.
+  const period = p.kind === 'bike' ? Math.min(16, Math.max(6, km * 0.45)) : Math.min(10, Math.max(3.5, km * 0.4));
+  const count = p.kind === 'bike' ? Math.min(4, Math.max(2, Math.round(km / 7))) : km > 14 ? 2 : 1;
+  return { ...p, cum, total: cum[cum.length - 1], period, count };
+}
+
+function pointAt(p, f) {
+  const d = f * p.total;
+  let lo = 0, hi = p.cum.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (p.cum[mid] <= d) lo = mid; else hi = mid; }
+  const a = p.coords[lo], b = p.coords[hi];
+  const t = p.cum[hi] > p.cum[lo] ? (d - p.cum[lo]) / (p.cum[hi] - p.cum[lo]) : 0;
+  return { ll: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t], west: b[1] < a[1] };
+}
+
+function moverIcon(p) {
+  const glyph = p.kind === 'bike' ? ICON.bike : ICON.train;
+  return L.divIcon({
+    className: '',
+    html: `<div class="mover ${p.kind}" style="--c:${p.color};--t:${p.text || '#fff'}">${glyph}</div>`,
+    iconSize: [26, 26], iconAnchor: [13, 13],
+  });
+}
+
+function startMovers(paths) {
+  movers = paths.filter((p) => p.coords.length > 1).map(prepPath).map((p) => ({
+    ...p,
+    markers: Array.from({ length: p.count }, () =>
+      L.marker(p.coords[0], { pane: 'movers', icon: moverIcon(p), interactive: false, keyboard: false }).addTo(tripLayer)),
+  }));
+  if (REDUCED_MOTION.matches) {
+    // No animation: park the icons along each leg so the direction still reads.
+    for (const p of movers) p.markers.forEach((m, j) => moveTo(m, p, (j + 0.6) / (p.count + 0.2)));
+    return;
+  }
+  const t0 = performance.now();
+  const frame = (now) => {
+    const sec = (now - t0) / 1000;
+    for (const p of movers) {
+      p.markers.forEach((m, j) => {
+        const f = (sec / p.period + j / p.count) % 1;
+        moveTo(m, p, f);
+        m.setOpacity(Math.min(1, f / 0.06, (1 - f) / 0.06)); // fade in at the start, out at the end
+      });
+    }
+    moverFrame = requestAnimationFrame(frame);
+  };
+  moverFrame = requestAnimationFrame(frame);
+}
+
+function moveTo(m, p, f) {
+  const { ll, west } = pointAt(p, f);
+  m.setLatLng(ll);
+  if (p.kind === 'bike') m.getElement()?.firstElementChild?.classList.toggle('west', west);
+}
+
+function stopMovers() {
+  cancelAnimationFrame(moverFrame);
+  movers = [];
+}
+
+let tripBounds = null;
+function drawTrip(c, fit = true) {
+  stopMovers();
+  tripLayer.clearLayers();
+  if (!c) { dimNetwork(false); tripBounds = null; return; }
+  dimNetwork(true);
+  const halo = cssVar('--panel') || '#fff';
+  const bounds = L.latLngBounds([]);
+  const paths = []; // what the moving icons follow, in travel order
+  for (const leg of [...c.out, ...c.back]) {
+    const pts = legCoords(leg);
+    pts.forEach((p) => bounds.extend(p));
+    if (leg.type === 'walk') {
+      const muted = cssVar('--muted');
+      L.polyline(pts, { renderer: rTrip, color: halo, weight: 9, interactive: false }).addTo(tripLayer);
+      L.polyline(pts, { renderer: rTrip, color: muted, weight: 4, dashArray: '1 7', lineCap: 'round', interactive: false }).addTo(tripLayer);
+      continue;
+    }
+    const { color, text } = net.routes[leg.routes[0]];
+    drawRailway(pts, color, halo);
+    paths.push({ kind: 'train', coords: pts, color, text });
+  }
+  const trail = cssVar('--trail');
+  const pieces = ridePieces(c);
+  for (const p of pieces) {
+    L.polyline(p.coords, { renderer: rTrip, color: halo, weight: 11, opacity: 1, interactive: false }).addTo(tripLayer);
+    L.polyline(p.coords, {
+      renderer: rTrip, color: trail, weight: 6.5, opacity: 1, lineCap: 'round',
+      dashArray: p.road ? '1 10' : null, interactive: false,
+    }).addTo(tripLayer);
+    p.coords.forEach((q) => bounds.extend(q));
+  }
+  const rideCoords = pieces.flatMap((p, i) => (i ? p.coords.slice(1) : p.coords));
+  if (rideCoords.length > 1) paths.push({ kind: 'bike', coords: rideCoords, color: trail });
+  startMovers(paths);
+  // One pin per station: ride start/end take priority over the home stations.
+  const to = state.to ?? state.from;
+  const placed = new Set();
+  const place = (s, kind, label, icon) => {
+    if (placed.has(s)) return;
+    placed.add(s);
+    pin(net.stations[s].ll, kind, label, icon);
+  };
+  place(c.s, 'ride', `Ride from ${stName(c.s)}`, ICON.bike);
+  place(c.e, 'ride', `Finish ride at ${stName(c.e)}`, ICON.flag);
+  place(state.from, 'home', stName(state.from), ICON.home);
+  place(to, 'home', stName(to), ICON.home);
+  tripBounds = bounds;
+  if (fit) fitTrip();
+}
+
+function fitTrip() {
+  if (!tripBounds || !tripBounds.isValid()) return;
+  if (!MOBILE.matches) {
+    map.fitBounds(tripBounds, { paddingTopLeft: [60, 50], paddingBottomRight: [60, 40], maxZoom: 15 });
+    return;
+  }
+  // Use where the sheet is heading, not where it is mid-animation.
+  const visibleSheet = panel.offsetHeight - sheetY(panel.dataset.state);
+  map.fitBounds(tripBounds, { paddingTopLeft: [56, 64], paddingBottomRight: [56, visibleSheet + 30], maxZoom: 15 });
+}
+
+function select(i, { fromList = false } = {}) {
+  state.sel = i;
+  document.querySelectorAll('.card').forEach((el) => el.setAttribute('aria-current', String(+el.dataset.i === i)));
+  renderPeek();
+  const c = state.list[i];
+  if (MOBILE.matches && fromList && c) setSheet('peek');
+  drawTrip(c, false);
+  if (c) fitTrip();
+  if (c && !MOBILE.matches) document.querySelector(`.card[data-i="${i}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  writeHash();
+}
+
+// ---------------------------------------------------------------------------
+// Exports: Google Maps link, GPX file
+// ---------------------------------------------------------------------------
+function samplePath(c, fractions) {
+  const pts = ridePieces(c).flatMap((p) => p.coords);
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + haversine(...pts[i - 1], ...pts[i]));
+  const total = cum[cum.length - 1];
+  return fractions.map((f) => pts[Math.max(0, cum.findIndex((d) => d >= f * total))]);
+}
+
+function gmapsUrl(c) {
+  const ll = (p) => `${p[0].toFixed(5)},${p[1].toFixed(5)}`;
+  const way = samplePath(c, [0.25, 0.5, 0.75]).map(ll).join('|');
+  const q = new URLSearchParams({
+    api: '1', travelmode: 'bicycling',
+    origin: ll(net.stations[c.s].ll), destination: ll(net.stations[c.e].ll), waypoints: way,
+  });
+  return `https://www.google.com/maps/dir/?${q}`;
+}
+
+function downloadGpx(c) {
+  if (!c) return;
+  const pts = ridePieces(c).flatMap((p, i) => (i ? p.coords.slice(1) : p.coords));
+  const name = `${stName(c.s)} to ${stName(c.e)} (${fmtKm(c.km)} km)`;
+  const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Train and Trail" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><name>${esc(name)}</name><trkseg>
+${pts.map(([la, lo]) => `    <trkpt lat="${la.toFixed(6)}" lon="${lo.toFixed(6)}"/>`).join('\n')}
+  </trkseg></trk>
+</gpx>
+`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([gpx], { type: 'application/gpx+xml' }));
+  a.download = `${stName(c.s)}-${stName(c.e)}.gpx`.replace(/\s+/g, '-').toLowerCase();
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+function buildControls() {
+  const order = net.stations.map((s, i) => [s.name, i]).sort((a, b) => a[0].localeCompare(b[0]));
+  $('fromSel').innerHTML = order.map(([n, i]) => `<option value="${i}">${esc(n)}</option>`).join('');
+  $('toSel').innerHTML = '<option value="">Back where I started</option>' + order.map(([n, i]) => `<option value="${i}">${esc(n)}</option>`).join('');
+  $('rangeChips').innerHTML = RANGES.map(([lo, hi], i) =>
+    `<button class="chip" role="radio" data-r="${i}" aria-checked="${i === state.range}">${lo}–${hi}<small> km</small></button>`).join('');
+  $('outChips').innerHTML = OUT_BANDS.map(([lo, hi, name], i) =>
+    `<button class="chip two-line" role="radio" data-o="${i}" aria-checked="${i === state.out}">${name}<small>${lo}–${hi} min</small></button>`).join('');
+
+  $('fromSel').addEventListener('change', (e) => { state.from = +e.target.value; if (state.to === state.from) state.to = null; syncSelects(); refresh(); });
+  $('toSel').addEventListener('change', (e) => { state.to = e.target.value === '' ? null : +e.target.value; if (state.to === state.from) state.to = null; refresh(); });
+  $('rangeChips').addEventListener('click', (e) => {
+    const b = e.target.closest('.chip'); if (!b) return;
+    state.range = +b.dataset.r; refresh();
+  });
+  $('outChips').addEventListener('click', (e) => {
+    const b = e.target.closest('.chip'); if (!b) return;
+    state.out = +b.dataset.o; refresh();
+  });
+  $('shuffleBtn').addEventListener('click', () => { state.seed += 1; state.shuffled = true; refresh(); });
+  $('locateBtn').addEventListener('click', locate);
+  $('pickFromBtn').addEventListener('click', () => startPick('from'));
+  $('pickToBtn').addEventListener('click', () => startPick('to'));
+  $('pickCancel').addEventListener('click', endPick);
+}
+
+function syncSelects() {
+  $('fromSel').value = String(state.from);
+  $('toSel').value = state.to == null ? '' : String(state.to);
+  document.querySelectorAll('#rangeChips .chip').forEach((b) => b.setAttribute('aria-checked', String(+b.dataset.r === state.range)));
+  document.querySelectorAll('#outChips .chip').forEach((b) => b.setAttribute('aria-checked', String(+b.dataset.o === state.out)));
+}
+
+// ---------------------------------------------------------------------------
+// "Choose on map": tap anywhere, and the nearest station becomes the start or finish.
+// ---------------------------------------------------------------------------
+function startPick(which) {
+  state.picking = which;
+  document.body.classList.add('picking');
+  $('pickText').textContent = which === 'from'
+    ? 'Tap the map where you’ll start. The nearest station will be used.'
+    : 'Tap the map where you want to finish. The nearest station will be used.';
+  $('pickBanner').hidden = false;
+  map.closePopup();
+  if (MOBILE.matches) setSheet('peek');
+}
+
+function endPick() {
+  state.picking = null;
+  document.body.classList.remove('picking');
+  $('pickBanner').hidden = true;
+}
+
+// "preclick" always reaches the map, even when the tap lands on a trail or station
+// (their popups stop the normal "click"). Popups are held back for that tap.
+let noPopupsUntil = 0;
+map.on('popupopen', () => { if (state.picking || Date.now() < noPopupsUntil) map.closePopup(); });
+map.on('preclick', (e) => {
+  if (!state.picking) return;
+  noPopupsUntil = Date.now() + 500;
+  const which = state.picking;
+  const { lat, lng } = e.latlng;
+  let best = -1, bd = Infinity;
+  net.stations.forEach((s, i) => { const d = haversine(lat, lng, ...s.ll); if (d < bd) { bd = d; best = i; } });
+  if (bd > 8000) { toast('That spot is more than 8 km from any train station. Try closer to a train line.'); return; }
+  endPick();
+  if (MOBILE.matches) setSheet('half'); // before refresh, so the new ride is fitted above the sheet
+  if (which === 'from') { state.from = best; if (state.to === best) state.to = null; }
+  else state.to = best === state.from ? null : best;
+  syncSelects();
+  refresh();
+  toast(`${which === 'from' ? 'Starting' : 'Finishing'} at ${stName(best)} station${bd > 300 ? ` (${fmtKm(bd / 1000)} km from where you tapped)` : ''}.`);
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.picking) endPick(); });
+
+// "Near me": start from the station closest to you.
+function locate() {
+  const btn = $('locateBtn');
+  const useFix = (la, lo) => {
+    let best = 0, bd = Infinity;
+    net.stations.forEach((s, i) => { const d = haversine(la, lo, ...s.ll); if (d < bd) { bd = d; best = i; } });
+    if (bd > 60000) { toast('You seem to be outside Melbourne, so I kept your current station.'); return; }
+    state.from = best; if (state.to === best) state.to = null;
+    syncSelects(); refresh();
+    toast(`Starting from ${stName(best)}, your nearest station (${fmtKm(bd / 1000)} km away).`);
+  };
+  if (me.fix && Date.now() - me.fix.at < 120000) { useFix(...me.fix.ll); return; }
+  if (!('geolocation' in navigator)) { toast('This browser can’t share your location.'); return; }
+  if (!window.isSecureContext) { toast('Your location only works on a secure (https) page, e.g. the published site on github.io.'); return; }
+  btn.disabled = true;
+  navigator.geolocation.getCurrentPosition((pos) => {
+    btn.disabled = false;
+    useFix(pos.coords.latitude, pos.coords.longitude);
+    // Keep showing the blue dot from now on, without moving the map off the ride.
+    me.centred = true;
+    showFix(pos);
+    me.wanted = true;
+    startWatch();
+  }, (err) => {
+    btn.disabled = false;
+    toast(err.code === 1 ? 'Location is blocked for this site. You can allow it in your browser’s site settings.' : 'Couldn’t get your location.');
+  }, { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 });
+}
+
+function refresh({ keepSelection = false } = {}) {
+  syncSelects();
+  store.set('tt.from', stName(state.from));
+  store.set('tt.to', state.to == null ? '' : stName(state.to));
+  store.set('tt.range', String(state.range));
+  store.set('tt.out', String(state.out));
+  state.list = suggest();
+  state.sel = -1;
+  renderCards();
+  select(state.list.length ? 0 : -1);
+  if (!keepSelection) $('panelScroll').scrollTo?.({ top: 0 });
+}
+
+// ---------------------------------------------------------------------------
+// URL hash (shareable links) — #from=Anzac&to=Flinders%20Street&km=20-30&ride=Hughesdale~Alphington
+// ---------------------------------------------------------------------------
+const stationByName = (n) => net.stations.findIndex((s) => s.name.toLowerCase() === String(n || '').toLowerCase());
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const from = stationByName(p.get('from'));
+  if (from >= 0) state.from = from;
+  const to = stationByName(p.get('to'));
+  state.to = to >= 0 && to !== state.from ? to : (p.has('from') ? null : state.to);
+  const km = p.get('km');
+  const r = RANGES.findIndex(([lo, hi]) => `${lo}-${hi}` === km);
+  if (r >= 0) state.range = r;
+  const o = OUT_BANDS.findIndex(([lo, hi]) => `${lo}-${hi}` === p.get('out'));
+  if (o >= 0) state.out = o;
+  const t = trails.findIndex((x) => x.name === p.get('trail'));
+  if (t >= 0) state.trail = t;
+  const ride = (p.get('ride') || '').split('~');
+  if (ride.length === 2) {
+    const s = stationByName(ride[0]), e = stationByName(ride[1]);
+    if (s >= 0 && e >= 0) state.shared = { s, e };
+  }
+}
+function writeHash() {
+  const p = new URLSearchParams();
+  p.set('from', stName(state.from));
+  if (state.to != null) p.set('to', stName(state.to));
+  p.set('km', RANGES[state.range].join('-'));
+  p.set('out', OUT_BANDS[state.out].slice(0, 2).join('-'));
+  if (state.trail != null) p.set('trail', trails[state.trail].name);
+  const c = state.list[state.sel];
+  if (c) p.set('ride', `${stName(c.s)}~${stName(c.e)}`);
+  history.replaceState(null, '', '#' + p.toString().replace(/\+/g, '%20'));
+}
+
+// ---------------------------------------------------------------------------
+// Bottom sheet (phones)
+// ---------------------------------------------------------------------------
+const panel = $('panel');
+const peekH = () => parseFloat(cssVar('--peek-h')) || 92;
+function sheetY(name) {
+  const H = panel.offsetHeight;
+  return name === 'full' ? 0 : name === 'half' ? Math.round(H * 0.45) : H - peekH();
+}
+function setSheet(name) {
+  panel.dataset.state = name;
+  if (MOBILE.matches) panel.style.setProperty('--sheet-y', `${sheetY(name)}px`);
+}
+let drag = null;
+function onDown(e) {
+  if (!MOBILE.matches || e.target.closest('button, a')) return;
+  drag = { y0: e.clientY, base: sheetY(panel.dataset.state), y: sheetY(panel.dataset.state), moved: false, id: e.pointerId, el: e.currentTarget };
+  panel.classList.add('dragging');
+  e.currentTarget.setPointerCapture?.(e.pointerId);
+}
+function onMove(e) {
+  if (!drag) return;
+  const dy = e.clientY - drag.y0;
+  if (Math.abs(dy) > 5) drag.moved = true;
+  drag.y = Math.max(0, Math.min(panel.offsetHeight - peekH(), drag.base + dy));
+  panel.style.setProperty('--sheet-y', `${drag.y}px`);
+}
+function onUp() {
+  if (!drag) return;
+  const d = drag; drag = null;
+  panel.classList.remove('dragging');
+  const cur = panel.dataset.state;
+  if (!d.moved) { setSheet(cur === 'peek' ? 'half' : cur === 'half' ? 'full' : 'peek'); return; }
+  const best = ['full', 'half', 'peek'].reduce((a, b) => (Math.abs(sheetY(a) - d.y) <= Math.abs(sheetY(b) - d.y) ? a : b));
+  setSheet(best);
+  if (best === 'peek') fitTrip();
+}
+for (const el of [$('sheetGrab'), $('peek')]) {
+  el.addEventListener('pointerdown', onDown);
+  el.addEventListener('pointermove', onMove);
+  el.addEventListener('pointerup', onUp);
+  el.addEventListener('pointercancel', onUp);
+}
+$('sheetGrab').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); const c = panel.dataset.state; setSheet(c === 'peek' ? 'half' : c === 'half' ? 'full' : 'peek'); }
+});
+window.addEventListener('resize', () => setSheet(panel.dataset.state));
+// Keep Leaflet in sync with its container whatever changes the layout.
+let fitPending = true;
+new ResizeObserver(() => {
+  map.invalidateSize();
+  if (fitPending && tripBounds) { fitPending = false; fitTrip(); }
+}).observe($('map'));
+MOBILE.addEventListener?.('change', () => {
+  if (!MOBILE.matches) panel.style.removeProperty('--sheet-y'); else setSheet(panel.dataset.state);
+  setTimeout(() => { map.invalidateSize(); fitTrip(); }, 50);
+});
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+async function boot() {
+  const get = (n) => fetch(`data/${n}.json`).then((r) => { if (!r.ok) throw new Error(`data/${n}.json: ${r.status}`); return r.json(); });
+  const [T, N, G, RD] = await Promise.all(['trails', 'network', 'graph', 'rides'].map(get));
+  trails = T.trails; net = N; rides = RD.rides;
+  g = buildRideGraph(trails, G.extra, G.stationLinks, net.stations.map((s) => s.ll));
+  tg = buildTrainGraph(net);
+  $('builtDate').textContent = `timetable of ${N.built}`;
+
+  drawNetwork();
+  buildControls();
+  window.trainAndTrail = { map, state, trailLines }; // handy for debugging in the console
+
+  const from = stationByName(store.get('tt.from'));
+  state.from = from >= 0 ? from : Math.max(0, stationByName(DEFAULT_FROM));
+  const to = stationByName(store.get('tt.to'));
+  state.to = to >= 0 && to !== state.from ? to : null;
+  const r = parseInt(store.get('tt.range'), 10);
+  if (r >= 0 && r < RANGES.length) state.range = r;
+  const o = parseInt(store.get('tt.out'), 10);
+  if (o >= 0 && o < OUT_BANDS.length) state.out = o;
+  readHash();
+
+  setSheet('half');
+  refresh();
+  map.invalidateSize();
+  fitTrip();
+  $('loading').classList.add('done');
+  setTimeout(() => $('loading').remove(), 400);
+}
+
+// Offline support for the installed app (needs https; localhost works for testing).
+// Registered once the app's own data is in, rather than on window "load", which waits for every map tile.
+function registerServiceWorker() {
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register('sw.js').catch((e) => console.warn('Service worker:', e.message));
+  }
+}
+
+boot().then(registerServiceWorker).catch((err) => {
+  console.error(err);
+  $('loading').innerHTML = `<p>Sorry, the map data could not be loaded.<br><small>${esc(err.message)}</small></p>`;
+});

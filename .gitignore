@@ -1,0 +1,6 @@
+# Raw inputs are large (GTFS ~120 MB); only generated data/ is committed.
+data-raw/
+node_modules/
+.claude/
+.DS_Store
+Thumbs.db

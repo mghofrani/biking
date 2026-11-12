@@ -1,0 +1,10 @@
+{
+  "name": "biking",
+  "private": true,
+  "type": "module",
+  "description": "Train-assisted bike rides around Melbourne: trails + metro trains on one map.",
+  "scripts": {
+    "build-data": "node scripts/build-data.mjs",
+    "serve": "node scripts/serve.mjs 8080"
+  }
+}
