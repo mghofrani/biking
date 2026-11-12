@@ -1,4 +1,4 @@
-import { buildRideGraph, dijkstra, pathPieces, haversine } from './ridegraph.js';
+import { buildRideGraph, dijkstra, pathPieces, pathEdges, summarisePath, haversine } from './ridegraph.js';
 import { buildTrainGraph, trainSearch, trainJourney, journeyStats } from './trains.js';
 
 // ---------------------------------------------------------------------------
@@ -6,10 +6,7 @@ import { buildTrainGraph, trainSearch, trainJourney, journeyStats } from './trai
 // ---------------------------------------------------------------------------
 const RANGES = [[10, 20], [20, 30], [30, 45], [45, 80]];
 const DEFAULT_RANGE = 1;
-// How long the train trip out to the start of the ride takes (minutes). Every ride starts with one.
-const OUT_BANDS = [[4, 25, 'Nearby'], [25, 45, 'Suburbs'], [45, 80, 'Far out']];
-const DEFAULT_OUT = 1;
-const DEFAULT_FROM = 'Flinders Street';
+const DEFAULT_TRAIN_STATION = 'Flinders Street'; // first suggestion when a train is added
 const RIDE_KMH = 15;          // relaxed average incl. stops
 const MAX_TRAIN_MIN = 90;     // each way
 const N_SUGGEST = 6;
@@ -51,7 +48,16 @@ function rnd(seed, a, b) { // deterministic 0..1
 // State
 // ---------------------------------------------------------------------------
 let trails, net, rides, g, tg;
-const state = { from: 0, to: null, range: DEFAULT_RANGE, out: DEFAULT_OUT, seed: dayNumber(), shuffled: false, trail: null, list: [], sel: -1, shared: null, picking: null };
+let rideStations;             // stations next to a trail: where a ride can start or finish
+const trailStations = new Map(); // trail index -> stations linked to it
+// The plan is built around the ride:
+//   start / finish   where the ride starts and ends (finish null = suggest finishes by distance)
+//   trainFrom        optional train trip to the start
+//   trainTo          optional train trip onwards from the finish
+const state = {
+  start: null, finish: null, range: DEFAULT_RANGE, trainFrom: null, trainTo: null,
+  seed: dayNumber(), shuffled: false, list: [], sel: -1, sharedEnd: null, picking: null,
+};
 const rideCache = new Map();
 
 // ---------------------------------------------------------------------------
@@ -352,26 +358,47 @@ const lineChips = (routeIdxs, max = 4) => {
   return shown.join('');
 };
 
+let lastTap = null; // where the map was last tapped (set on "preclick", before any popup opens)
+
+function nearestStation(lat, lng, only = null) {
+  let best = -1, bd = Infinity;
+  net.stations.forEach((s, i) => {
+    if (only && !only.has(i)) return;
+    const d = haversine(lat, lng, ...s.ll);
+    if (d < bd) { bd = d; best = i; }
+  });
+  return [best, bd];
+}
+
 function trailPopup(i) {
   const t = trails[i];
   const bits = [`${t.km} km`, t.mins ? `~${fmtDur(t.mins)}` : null, t.grade].filter(Boolean).join(' · ');
+  // The trail-side station nearest to where the trail was tapped.
+  const linked = new Set(trailStations.get(i) || []);
+  const [s] = lastTap && linked.size ? nearestStation(lastTap.lat, lastTap.lng, linked) : [-1];
+  const acts = s >= 0
+    ? `<button class="btn primary" data-act="start" data-i="${s}">Start biking at ${esc(stName(s))}</button>
+       <button class="btn" data-act="finish" data-i="${s}">Finish biking at ${esc(stName(s))}</button>`
+    : '';
   return `<div class="pop">
     <h4>${esc(t.name)}</h4>
     <div class="meta">${esc(bits)}</div>
-    <div class="acts">
-      <button class="btn primary" data-act="trail" data-i="${i}">Rides on this trail</button>
+    <div class="acts">${acts}
       <a class="btn" href="${SOURCE_SITE}" target="_blank" rel="noopener">Trail guide ↗</a>
     </div></div>`;
 }
 
 function stationPopup(i) {
   const s = net.stations[i];
+  const rideable = rideStations.has(i);
   return `<div class="pop">
     <h4>${esc(s.name)}</h4>
     <div class="meta">${lineChips(s.routes, 6)}</div>
     <div class="acts">
-      <button class="btn primary" data-act="from" data-i="${i}">Start here</button>
-      <button class="btn" data-act="to" data-i="${i}">Finish here</button>
+      ${rideable ? `<button class="btn primary" data-act="start" data-i="${i}">Start biking here</button>
+      <button class="btn" data-act="finish" data-i="${i}">Finish biking here</button>` : ''}
+      <button class="btn" data-act="trainFrom" data-i="${i}">Train from here</button>
+      <button class="btn" data-act="trainTo" data-i="${i}">Train to here</button>
       ${s.url ? `<a class="btn" href="${esc(s.url)}" target="_blank" rel="noopener">Station info ↗</a>` : ''}
     </div></div>`;
 }
@@ -380,93 +407,121 @@ document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-act]');
   if (!b) return;
   const i = +b.dataset.i;
+  const act = b.dataset.act;
   map.closePopup();
-  if (b.dataset.act === 'from') { state.from = i; syncSelects(); refresh(); }
-  if (b.dataset.act === 'to') { state.to = i === state.from ? null : i; syncSelects(); refresh(); }
-  if (b.dataset.act === 'trail') { state.trail = i; refresh(); }
-  if (b.dataset.act === 'clear-trail') { state.trail = null; refresh(); }
-  if (b.dataset.act === 'gpx') downloadGpx(state.list[state.sel]);
+  if (act === 'start' || act === 'finish' || act === 'trainFrom' || act === 'trainTo') setPoint(act, i);
+  if (act === 'surprise') surprise();
+  if (act === 'gpx') downloadGpx(state.list[state.sel]);
 });
+
+/** Sets one of the four plan points and refreshes the ideas. */
+function setPoint(which, i) {
+  if (which === 'start') {
+    state.start = i;
+    if (state.finish === i) state.finish = null;
+    state.sharedEnd = null;
+  } else if (which === 'finish') {
+    if (i === state.start) { toast('That’s where the ride starts. Pick a different finish, or leave it on “Suggest”.'); return; }
+    state.finish = i;
+  } else {
+    state[which] = i;
+  }
+  refresh();
+}
+
+function surprise() {
+  const list = [...rideStations];
+  setPoint('start', list[Math.floor(Math.random() * list.length)]);
+}
 
 // ---------------------------------------------------------------------------
 // Suggestions
 // ---------------------------------------------------------------------------
-function makeCandidate(rideIdx, s, e, out, back, score = 0) {
-  const [a, , km10, road10, seq] = rides[rideIdx];
-  return {
-    ride: rideIdx, s, e, score,
-    km: km10 / 10, road: road10 / 10,
-    seq: s === a ? seq : seq.slice().reverse(),
-    t1: out.minutes[s], t2: back.minutes[e],
-  };
+// A precomputed ride (rides.json) seen from station s.
+function fromRide(rideIdx, s) {
+  const [a, b, km10, road10, seq] = rides[rideIdx];
+  return { s, e: s === a ? b : a, km: km10 / 10, road: road10 / 10, seq: s === a ? seq : seq.slice().reverse() };
 }
 
+// Any start → finish pair, worked out on the spot along the trail network.
+function rideBetween(s, e) {
+  const res = rideResult(s);
+  const target = g.stationNode(e);
+  if (!isFinite(res.dist[target])) return null;
+  const sum = summarisePath(g, pathEdges(res, target));
+  return { s, e, km: sum.m / 1000, road: sum.road / 1000, seq: sum.seq };
+}
+
+/** The ride ideas for the current plan (empty until a start is chosen). */
 function suggest() {
-  const from = state.from, to = state.to ?? state.from;
+  const S = state.start;
+  if (S == null) return [];
+
+  // Finish chosen: one ride, start to finish.
+  if (state.finish != null) {
+    const c = rideBetween(S, state.finish);
+    return c ? addTrains([Object.assign(c, { chosen: true })]) : [];
+  }
+
+  // No finish: ideas of the chosen length from the start, ending at different stations.
   const [lo, hi] = RANGES[state.range];
   const mid = (lo + hi) / 2;
-  const [olo, ohi] = OUT_BANDS[state.out];
-  const omid = (olo + ohi) / 2;
-  const out = trainSearch(tg, from);
-  const back = to === from ? out : trainSearch(tg, to);
+  const onward = state.trainTo != null ? trainSearch(tg, state.trainTo) : null;
   const cands = [];
-  rides.forEach(([a, b, km10, road10, seq], i) => {
+  rides.forEach(([a, b, km10, road10], i) => {
+    if (a !== S && b !== S) return;
     const km = km10 / 10;
     if (km < lo || km > hi) return;
-    if (state.trail != null && !seq.some((q) => q[0] === state.trail)) return;
-    for (const [s, e] of [[a, b], [b, a]]) {
-      const t1 = out.minutes[s], t2 = back.minutes[e];
-      // Day shape: train out (in the chosen time band) → ride → train home.
-      if (!(t1 >= olo && t1 <= ohi && t2 <= MAX_TRAIN_MIN)) continue;
-      // A ride that ends a short walk from home is a duplicate of the one that ends at home.
-      if (out.walkOnly[s] || back.walkOnly[e]) continue;
-      // Mild preference for a shorter trip home, little road riding, and distances mid-band.
-      const score = t2 * 0.4 + road10 * 1.5 + Math.abs(km - mid) * 0.5 + Math.abs(t1 - omid) * 0.3 + rnd(state.seed, s, e) * 40;
-      cands.push([score, i, s, e]);
-    }
+    const e = a === S ? b : a;
+    // With an onward train, prefer finishes with a shorter trip to it.
+    const tOn = onward ? onward.minutes[e] : 0;
+    if (!(tOn <= MAX_TRAIN_MIN)) return;
+    const score = road10 * 1.5 + Math.abs(km - mid) * 0.5 + tOn * 0.4 + rnd(state.seed, S, e) * 40;
+    cands.push([score, i, e]);
   });
   cands.sort((x, y) => x[0] - y[0]);
 
-  // Keep the list varied: different trails, different start stations, and mostly
-  // "train → ride → train" days (at most two rides that finish right at your destination).
-  const picked = [], sets = [], perStart = new Map(), pairs = new Set();
-  let rideHome = 0;
-  for (const [score, i, s, e] of cands) {
+  // Keep the list varied: different finishes along different trails.
+  const picked = [], sets = [];
+  for (const [, i] of cands) {
     if (picked.length >= N_SUGGEST) break;
-    const pairKey = Math.min(s, e) + '|' + Math.max(s, e);
-    if (pairs.has(pairKey) || (perStart.get(s) || 0) >= 2) continue;
-    if (e === to && rideHome >= 2) continue;
     const set = new Set(rides[i][4].map((q) => q[0]));
     const similar = sets.some((o) => {
       let inter = 0; for (const x of set) if (o.has(x)) inter++;
       return inter / (set.size + o.size - inter) >= 0.5;
     });
     if (similar) continue;
-    picked.push(makeCandidate(i, s, e, out, back, score));
-    sets.push(set); pairs.add(pairKey); perStart.set(s, (perStart.get(s) || 0) + 1);
-    if (e === to) rideHome++;
+    picked.push(fromRide(i, S));
+    sets.push(set);
   }
 
-  // A ride opened from a shared link always shows first.
-  if (state.shared) {
-    const { s, e } = state.shared;
-    const i = rides.findIndex(([a, b]) => (a === s && b === e) || (a === e && b === s));
-    const already = picked.findIndex((c) => c.s === s && c.e === e);
+  // A ride opened from a shared link shows first.
+  if (state.sharedEnd != null) {
+    const e = state.sharedEnd;
+    const already = picked.findIndex((c) => c.e === e);
     if (already >= 0) picked.unshift(...picked.splice(already, 1));
-    else if (i >= 0) picked.unshift(Object.assign(makeCandidate(i, s, e, out, back), { sharedLink: true }));
-    state.shared = null;
+    else {
+      const c = rideBetween(S, e);
+      if (c) picked.unshift(Object.assign(c, { sharedLink: true }));
+    }
+    state.sharedEnd = null;
   }
+  return addTrains(picked);
+}
 
-  for (const c of picked) {
-    c.out = trainJourney(tg, net, out, c.s) || [];
-    const fromEnd = trainSearch(tg, c.e);
-    c.back = trainJourney(tg, net, fromEnd, to) || [];
-    c.outStats = journeyStats(c.out);
-    c.backStats = journeyStats(c.back);
+/** Adds the optional train to the start and train onwards from the finish. */
+function addTrains(list) {
+  const toStart = state.trainFrom != null ? trainSearch(tg, state.trainFrom) : null;
+  for (const c of list) {
+    c.out = toStart ? trainJourney(tg, net, toStart, c.s) || [] : null;
+    c.back = state.trainTo != null ? trainJourney(tg, net, trainSearch(tg, c.e), state.trainTo) || [] : null;
+    c.outStats = c.out ? journeyStats(c.out) : { mins: 0, changes: 0 };
+    c.backStats = c.back ? journeyStats(c.back) : { mins: 0, changes: 0 };
     c.rideMins = (c.km / RIDE_KMH) * 60;
     c.total = c.outStats.mins + c.rideMins + c.backStats.mins;
+    c.withTrains = !!(c.out || c.back);
   }
-  return picked;
+  return list;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,9 +530,9 @@ function suggest() {
 const stName = (i) => net.stations[i].name;
 
 function trainStep(legs, stats, from, to, isReturn) {
-  if (!legs.length) {
+  if (!legs.length) { // the train station is the ride's start / finish
     return `<li class="step"><span class="ico">${ICON.home}</span><div class="step-main">
-      <div class="step-title">${isReturn ? `Finish at ${esc(stName(to))}` : `Start riding at ${esc(stName(from))}`}</div>
+      <div class="step-title">${isReturn ? `Finish at ${esc(stName(from))}` : `Start at ${esc(stName(to))}`}</div>
       <div class="step-sub">No train needed</div></div></li>`;
   }
   const parts = legs.map((l) => (l.type === 'walk'
@@ -503,34 +558,41 @@ function rideStep(c) {
 function renderCards() {
   const list = state.list;
   const [lo, hi] = RANGES[state.range];
-  $('resultsTitle').textContent = list.length ? `${list.length} ride ideas · ${lo}–${hi} km` : 'Ride ideas';
-  const fb = $('filterBar');
-  fb.hidden = state.trail == null;
-  if (state.trail != null) {
-    fb.innerHTML = `Only rides using <span class="filter-chip">${esc(trails[state.trail].name)}
-      <button data-act="clear-trail" aria-label="Clear trail filter">×</button></span>`;
+  const ideas = state.finish == null;
+  $('resultsTitle').textContent = state.start == null ? 'Your ride'
+    : !ideas ? 'Your ride'
+    : list.length ? `${list.length} ride ideas · ${lo}–${hi} km` : 'Ride ideas';
+  $('shuffleBtn').hidden = !ideas || list.length < 2;
+
+  if (state.start == null) {
+    $('cards').innerHTML = `<li class="empty intro">
+      <strong>Where would you like to start riding?</strong>
+      <span>Choose a station above, use your location, pick a spot on the map, or tap any trail or station on the map.</span>
+      <button class="btn primary" data-act="surprise" type="button">Surprise me</button>
+    </li>`;
+    renderPeek();
+    return;
   }
-  const to = state.to ?? state.from;
   if (!list.length) {
-    const [olo, ohi] = OUT_BANDS[state.out];
-    $('cards').innerHTML = `<li class="empty">No ${lo}–${hi} km rides start ${olo}–${ohi} min by train from
-      ${esc(stName(state.from))}${state.trail != null ? ' on this trail' : ''}. Try another train time or distance${state.trail != null ? ', or clear the trail filter' : ''}.</li>`;
+    $('cards').innerHTML = ideas
+      ? `<li class="empty">No ${lo}–${hi} km trail rides start at ${esc(stName(state.start))}. Try another distance, or choose where to finish.</li>`
+      : `<li class="empty">Couldn’t find a trail route from ${esc(stName(state.start))} to ${esc(stName(state.finish))}. Try another finish.</li>`;
     renderPeek();
     return;
   }
   $('cards').innerHTML = list.map((c, i) => {
-    const pill = c.sharedLink ? 'Shared ride' : i === 0 && !state.shuffled && state.trail == null ? "Today's pick" : '';
+    const pill = c.sharedLink ? 'Shared ride' : c.chosen ? '' : i === 0 && !state.shuffled ? "Today's pick" : '';
     return `<li class="card" data-i="${i}" tabindex="0" role="button" aria-current="${i === state.sel}">
       <div class="card-top">
         <span class="km">${fmtKm(c.km)}<small> km</small></span>
-        <span class="day">day out ≈ ${fmtDur(c.total)}</span>
+        <span class="day">${c.withTrains ? 'day out' : 'riding'} ≈ ${fmtDur(c.total)}</span>
         ${pill ? `<span class="pill">${pill}</span>` : ''}
       </div>
       <h3>${esc(stName(c.s))} → ${esc(stName(c.e))}</h3>
       <ol class="steps">
-        ${trainStep(c.out, c.outStats, state.from, c.s, false)}
+        ${c.out ? trainStep(c.out, c.outStats, state.trainFrom, c.s, false) : ''}
         ${rideStep(c)}
-        ${trainStep(c.back, c.backStats, c.e, to, true)}
+        ${c.back ? trainStep(c.back, c.backStats, c.e, state.trainTo, true) : ''}
       </ol>
       <div class="card-actions">
         <a class="btn" href="${gmapsUrl(c)}" target="_blank" rel="noopener">Open ride in Google Maps ↗</a>
@@ -560,8 +622,10 @@ function renderPeek() {
   $('peekPrev').disabled = $('peekNext').disabled = n < 2;
   $('peekBody').innerHTML = c
     ? `<div class="peek-title"><span class="km">${fmtKm(c.km)}<small> km</small></span> ${esc(stName(c.s))} → ${esc(stName(c.e))}</div>
-       <div class="peek-sub">${state.sel + 1} of ${n} · day out ≈ ${fmtDur(c.total)} · tap for details</div>`
-    : `<div class="peek-title">${n ? `${n} ride ideas` : 'No rides found'}</div><div class="peek-sub">Tap to choose a ride</div>`;
+       <div class="peek-sub">${n > 1 ? `${state.sel + 1} of ${n} · ` : ''}${c.withTrains ? 'day out' : 'riding'} ≈ ${fmtDur(c.total)} · tap for details</div>`
+    : state.start == null
+      ? '<div class="peek-title">Where would you like to start riding?</div><div class="peek-sub">Tap here to choose</div>'
+      : `<div class="peek-title">${n ? `${n} ride ideas` : 'No rides found'}</div><div class="peek-sub">Tap to see them</div>`;
 }
 $('peekPrev').addEventListener('click', () => step(-1));
 $('peekNext').addEventListener('click', () => step(1));
@@ -575,7 +639,7 @@ function step(d) {
 // Selected trip on the map
 // ---------------------------------------------------------------------------
 function rideResult(s) {
-  if (!rideCache.has(s)) rideCache.set(s, dijkstra(g, g.stationNode(s), 80 * 1000 * 1.6));
+  if (!rideCache.has(s)) rideCache.set(s, dijkstra(g, g.stationNode(s), 250 * 1000));
   return rideCache.get(s);
 }
 const ridePieces = (c) => pathPieces(g, rideResult(c.s), g.stationNode(c.e));
@@ -685,12 +749,18 @@ let tripBounds = null;
 function drawTrip(c, fit = true) {
   stopMovers();
   tripLayer.clearLayers();
-  if (!c) { dimNetwork(false); tripBounds = null; return; }
+  if (!c) {
+    dimNetwork(false);
+    tripBounds = null;
+    // A start with no ride yet still gets its pin, so you can see what you picked.
+    if (state.start != null) pin(net.stations[state.start].ll, 'ride', `Start biking at ${stName(state.start)}`, ICON.bike);
+    return;
+  }
   dimNetwork(true);
   const halo = cssVar('--panel') || '#fff';
   const bounds = L.latLngBounds([]);
   const paths = []; // what the moving icons follow, in travel order
-  for (const leg of [...c.out, ...c.back]) {
+  for (const leg of [...(c.out || []), ...(c.back || [])]) {
     const pts = legCoords(leg);
     pts.forEach((p) => bounds.extend(p));
     if (leg.type === 'walk') {
@@ -716,18 +786,17 @@ function drawTrip(c, fit = true) {
   const rideCoords = pieces.flatMap((p, i) => (i ? p.coords.slice(1) : p.coords));
   if (rideCoords.length > 1) paths.push({ kind: 'bike', coords: rideCoords, color: trail });
   startMovers(paths);
-  // One pin per station: ride start/end take priority over the home stations.
-  const to = state.to ?? state.from;
+  // One pin per station: ride start/finish take priority over the train stations.
   const placed = new Set();
   const place = (s, kind, label, icon) => {
-    if (placed.has(s)) return;
+    if (s == null || placed.has(s)) return;
     placed.add(s);
     pin(net.stations[s].ll, kind, label, icon);
   };
-  place(c.s, 'ride', `Ride from ${stName(c.s)}`, ICON.bike);
-  place(c.e, 'ride', `Finish ride at ${stName(c.e)}`, ICON.flag);
-  place(state.from, 'home', stName(state.from), ICON.home);
-  place(to, 'home', stName(to), ICON.home);
+  place(c.s, 'ride', `Start biking at ${stName(c.s)}`, ICON.bike);
+  place(c.e, 'ride', `Finish biking at ${stName(c.e)}`, ICON.flag);
+  if (c.out) place(state.trainFrom, 'home', `Train from ${stName(state.trainFrom)}`, ICON.train);
+  if (c.back) place(state.trainTo, 'home', `Train to ${stName(state.trainTo)}`, ICON.train);
   tripBounds = bounds;
   if (fit) fitTrip();
 }
@@ -797,48 +866,88 @@ ${pts.map(([la, lo]) => `    <trkpt lat="${la.toFixed(6)}" lon="${lo.toFixed(6)}
 // ---------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------
+const opts = (list) => list.map(([n, i]) => `<option value="${i}">${esc(n)}</option>`).join('');
+
 function buildControls() {
-  const order = net.stations.map((s, i) => [s.name, i]).sort((a, b) => a[0].localeCompare(b[0]));
-  $('fromSel').innerHTML = order.map(([n, i]) => `<option value="${i}">${esc(n)}</option>`).join('');
-  $('toSel').innerHTML = '<option value="">Back where I started</option>' + order.map(([n, i]) => `<option value="${i}">${esc(n)}</option>`).join('');
+  const all = net.stations.map((s, i) => [s.name, i]).sort((a, b) => a[0].localeCompare(b[0]));
+  const rideable = all.filter(([, i]) => rideStations.has(i));
+  $('startSel').innerHTML = '<option value="">Choose a station…</option>' + opts(rideable);
+  $('finishSel').innerHTML = '<option value="">Suggest by distance</option>' + opts(rideable);
+  $('trainFromSel').innerHTML = opts(all);
+  $('trainToSel').innerHTML = opts(all);
   $('rangeChips').innerHTML = RANGES.map(([lo, hi], i) =>
     `<button class="chip" role="radio" data-r="${i}" aria-checked="${i === state.range}">${lo}–${hi}<small> km</small></button>`).join('');
-  $('outChips').innerHTML = OUT_BANDS.map(([lo, hi, name], i) =>
-    `<button class="chip two-line" role="radio" data-o="${i}" aria-checked="${i === state.out}">${name}<small>${lo}–${hi} min</small></button>`).join('');
 
-  $('fromSel').addEventListener('change', (e) => { state.from = +e.target.value; if (state.to === state.from) state.to = null; syncSelects(); refresh(); });
-  $('toSel').addEventListener('change', (e) => { state.to = e.target.value === '' ? null : +e.target.value; if (state.to === state.from) state.to = null; refresh(); });
+  $('startSel').addEventListener('change', (e) => {
+    if (e.target.value === '') { state.start = null; refresh(); } else setPoint('start', +e.target.value);
+  });
+  $('finishSel').addEventListener('change', (e) => {
+    if (e.target.value === '') { state.finish = null; refresh(); } else setPoint('finish', +e.target.value);
+  });
+  $('trainFromSel').addEventListener('change', (e) => setPoint('trainFrom', +e.target.value));
+  $('trainToSel').addEventListener('change', (e) => setPoint('trainTo', +e.target.value));
   $('rangeChips').addEventListener('click', (e) => {
     const b = e.target.closest('.chip'); if (!b) return;
     state.range = +b.dataset.r; refresh();
   });
-  $('outChips').addEventListener('click', (e) => {
-    const b = e.target.closest('.chip'); if (!b) return;
-    state.out = +b.dataset.o; refresh();
+
+  // Optional trains: add / remove.
+  const remembered = (key) => { const i = stationByName(store.get(key)); return i >= 0 ? i : null; };
+  const fallback = Math.max(0, stationByName(DEFAULT_TRAIN_STATION));
+  $('addFromBtn').addEventListener('click', () => {
+    state.trainFrom = remembered('tt.from') ?? fallback;
+    refresh();
+    $('trainFromSel').focus();
   });
+  $('addToBtn').addEventListener('click', () => {
+    state.trainTo = state.trainFrom ?? remembered('tt.to') ?? fallback;
+    refresh();
+    $('trainToSel').focus();
+  });
+  $('removeFromBtn').addEventListener('click', () => { state.trainFrom = null; refresh(); });
+  $('removeToBtn').addEventListener('click', () => { state.trainTo = null; refresh(); });
+
   $('shuffleBtn').addEventListener('click', () => { state.seed += 1; state.shuffled = true; refresh(); });
-  $('locateBtn').addEventListener('click', locate);
-  $('pickFromBtn').addEventListener('click', () => startPick('from'));
-  $('pickToBtn').addEventListener('click', () => startPick('to'));
+  $('locateStartBtn').addEventListener('click', () => locate('start'));
+  $('locateFromBtn').addEventListener('click', () => locate('trainFrom'));
+  for (const which of ['start', 'finish', 'trainFrom', 'trainTo']) {
+    $(`pick-${which}`).addEventListener('click', () => startPick(which));
+  }
   $('pickCancel').addEventListener('click', endPick);
 }
 
-function syncSelects() {
-  $('fromSel').value = String(state.from);
-  $('toSel').value = state.to == null ? '' : String(state.to);
+/** Puts the state into the form and shows / hides the optional train rows. */
+function syncControls() {
+  $('startSel').value = state.start == null ? '' : String(state.start);
+  $('finishSel').value = state.finish == null ? '' : String(state.finish);
+  if (state.trainFrom != null) $('trainFromSel').value = String(state.trainFrom);
+  if (state.trainTo != null) $('trainToSel').value = String(state.trainTo);
   document.querySelectorAll('#rangeChips .chip').forEach((b) => b.setAttribute('aria-checked', String(+b.dataset.r === state.range)));
-  document.querySelectorAll('#outChips .chip').forEach((b) => b.setAttribute('aria-checked', String(+b.dataset.o === state.out)));
+  const hasStart = state.start != null;
+  $('rangeField').hidden = state.finish != null;
+  $('addFromBtn').hidden = !hasStart || state.trainFrom != null;
+  $('fromRow').hidden = !hasStart || state.trainFrom == null;
+  $('addToBtn').hidden = !hasStart || state.trainTo != null;
+  $('toRow').hidden = !hasStart || state.trainTo == null;
+  $('addFromBtn').querySelector('span').textContent = hasStart ? `Get to ${stName(state.start)} by train` : '';
+  $('addToBtn').querySelector('span').textContent = state.finish != null
+    ? `Continue by train from ${stName(state.finish)}` : 'Continue by train after the ride';
 }
 
 // ---------------------------------------------------------------------------
-// "Choose on map": tap anywhere, and the nearest station becomes the start or finish.
+// "Choose on map": tap anywhere, and the nearest station is used.
+// Ride start / finish use stations next to a trail; train stops can be any station.
 // ---------------------------------------------------------------------------
+const PICK_TEXT = {
+  start: 'Tap the map where you’d like to start riding.',
+  finish: 'Tap the map where you’d like to finish riding.',
+  trainFrom: 'Tap the map where you’ll catch the train from.',
+  trainTo: 'Tap the map where you want the train to take you.',
+};
 function startPick(which) {
   state.picking = which;
   document.body.classList.add('picking');
-  $('pickText').textContent = which === 'from'
-    ? 'Tap the map where you’ll start. The nearest station will be used.'
-    : 'Tap the map where you want to finish. The nearest station will be used.';
+  $('pickText').textContent = `${PICK_TEXT[which]} The nearest station will be used.`;
   $('pickBanner').hidden = false;
   map.closePopup();
   if (MOBILE.matches) setSheet('peek');
@@ -854,34 +963,29 @@ function endPick() {
 // (their popups stop the normal "click"). Popups are held back for that tap.
 let noPopupsUntil = 0;
 map.on('popupopen', () => { if (state.picking || Date.now() < noPopupsUntil) map.closePopup(); });
+const POINT_WORDS = { start: 'Start biking at', finish: 'Finish biking at', trainFrom: 'Train from', trainTo: 'Train to' };
 map.on('preclick', (e) => {
+  lastTap = e.latlng;
   if (!state.picking) return;
   noPopupsUntil = Date.now() + 500;
   const which = state.picking;
-  const { lat, lng } = e.latlng;
-  let best = -1, bd = Infinity;
-  net.stations.forEach((s, i) => { const d = haversine(lat, lng, ...s.ll); if (d < bd) { bd = d; best = i; } });
-  if (bd > 8000) { toast('That spot is more than 8 km from any train station. Try closer to a train line.'); return; }
+  const [best, bd] = nearestStation(e.latlng.lat, e.latlng.lng, which === 'start' || which === 'finish' ? rideStations : null);
+  if (bd > 8000) { toast('That spot is more than 8 km from a suitable station. Try closer to a trail or train line.'); return; }
   endPick();
   if (MOBILE.matches) setSheet('half'); // before refresh, so the new ride is fitted above the sheet
-  if (which === 'from') { state.from = best; if (state.to === best) state.to = null; }
-  else state.to = best === state.from ? null : best;
-  syncSelects();
-  refresh();
-  toast(`${which === 'from' ? 'Starting' : 'Finishing'} at ${stName(best)} station${bd > 300 ? ` (${fmtKm(bd / 1000)} km from where you tapped)` : ''}.`);
+  setPoint(which, best);
+  toast(`${POINT_WORDS[which]} ${stName(best)} station${bd > 300 ? ` (${fmtKm(bd / 1000)} km from where you tapped)` : ''}.`);
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.picking) endPick(); });
 
-// "Near me": start from the station closest to you.
-function locate() {
-  const btn = $('locateBtn');
+// "Near me": the ride start (nearest trail-side station) or the train-from station.
+function locate(which) {
+  const btn = $(which === 'start' ? 'locateStartBtn' : 'locateFromBtn');
   const useFix = (la, lo) => {
-    let best = 0, bd = Infinity;
-    net.stations.forEach((s, i) => { const d = haversine(la, lo, ...s.ll); if (d < bd) { bd = d; best = i; } });
-    if (bd > 60000) { toast('You seem to be outside Melbourne, so I kept your current station.'); return; }
-    state.from = best; if (state.to === best) state.to = null;
-    syncSelects(); refresh();
-    toast(`Starting from ${stName(best)}, your nearest station (${fmtKm(bd / 1000)} km away).`);
+    const [best, bd] = nearestStation(la, lo, which === 'start' ? rideStations : null);
+    if (bd > 60000) { toast('You seem to be outside Melbourne, so nothing was changed.'); return; }
+    setPoint(which, best);
+    toast(`${POINT_WORDS[which]} ${stName(best)}, the nearest station (${fmtKm(bd / 1000)} km away).`);
   };
   if (me.fix && Date.now() - me.fix.at < 120000) { useFix(...me.fix.ll); return; }
   if (!('geolocation' in navigator)) { toast('This browser can’t share your location.'); return; }
@@ -902,11 +1006,14 @@ function locate() {
 }
 
 function refresh({ keepSelection = false } = {}) {
-  syncSelects();
-  store.set('tt.from', stName(state.from));
-  store.set('tt.to', state.to == null ? '' : stName(state.to));
+  syncControls();
+  const save = (k, i) => store.set(k, i == null ? '' : stName(i));
+  save('tt.start', state.start);
+  save('tt.finish', state.finish);
+  if (state.trainFrom != null) save('tt.from', state.trainFrom); // remembered even after removing,
+  if (state.trainTo != null) save('tt.to', state.trainTo);       // as the next "add train" default
+  store.set('tt.trains', `${state.trainFrom != null ? 1 : 0}${state.trainTo != null ? 1 : 0}`);
   store.set('tt.range', String(state.range));
-  store.set('tt.out', String(state.out));
   state.list = suggest();
   state.sel = -1;
   renderCards();
@@ -915,37 +1022,37 @@ function refresh({ keepSelection = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// URL hash (shareable links) — #from=Anzac&to=Flinders%20Street&km=20-30&ride=Hughesdale~Alphington
+// URL hash (shareable links):
+//   #start=Hughesdale&finish=Alphington&from=Anzac&to=Flinders%20Street
+//   #start=Hughesdale&km=20-30&ride=Alphington      (ideas by distance, one selected)
 // ---------------------------------------------------------------------------
 const stationByName = (n) => net.stations.findIndex((s) => s.name.toLowerCase() === String(n || '').toLowerCase());
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
-  const from = stationByName(p.get('from'));
-  if (from >= 0) state.from = from;
-  const to = stationByName(p.get('to'));
-  state.to = to >= 0 && to !== state.from ? to : (p.has('from') ? null : state.to);
-  const km = p.get('km');
-  const r = RANGES.findIndex(([lo, hi]) => `${lo}-${hi}` === km);
+  if (![...p.keys()].length) return false;
+  const st = (k) => { const i = stationByName(p.get(k)); return i >= 0 ? i : null; };
+  const ride = (p.get('ride') || '').split('~'); // older links: ride=Start~Finish
+  state.start = st('start') ?? (ride.length === 2 ? stationByName(ride[0]) : -1);
+  if (!(state.start >= 0 && rideStations.has(state.start))) state.start = null;
+  state.finish = st('finish');
+  if (state.finish != null && (!rideStations.has(state.finish) || state.finish === state.start)) state.finish = null;
+  state.trainFrom = st('from');
+  state.trainTo = st('to');
+  const r = RANGES.findIndex(([lo, hi]) => `${lo}-${hi}` === p.get('km'));
   if (r >= 0) state.range = r;
-  const o = OUT_BANDS.findIndex(([lo, hi]) => `${lo}-${hi}` === p.get('out'));
-  if (o >= 0) state.out = o;
-  const t = trails.findIndex((x) => x.name === p.get('trail'));
-  if (t >= 0) state.trail = t;
-  const ride = (p.get('ride') || '').split('~');
-  if (ride.length === 2) {
-    const s = stationByName(ride[0]), e = stationByName(ride[1]);
-    if (s >= 0 && e >= 0) state.shared = { s, e };
-  }
+  const end = stationByName(ride[ride.length - 1]);
+  if (state.finish == null && end >= 0) state.sharedEnd = end;
+  return true;
 }
 function writeHash() {
   const p = new URLSearchParams();
-  p.set('from', stName(state.from));
-  if (state.to != null) p.set('to', stName(state.to));
-  p.set('km', RANGES[state.range].join('-'));
-  p.set('out', OUT_BANDS[state.out].slice(0, 2).join('-'));
-  if (state.trail != null) p.set('trail', trails[state.trail].name);
+  if (state.start != null) p.set('start', stName(state.start));
+  if (state.finish != null) p.set('finish', stName(state.finish));
+  else p.set('km', RANGES[state.range].join('-'));
+  if (state.trainFrom != null) p.set('from', stName(state.trainFrom));
+  if (state.trainTo != null) p.set('to', stName(state.trainTo));
   const c = state.list[state.sel];
-  if (c) p.set('ride', `${stName(c.s)}~${stName(c.e)}`);
+  if (c && state.finish == null) p.set('ride', stName(c.e));
   history.replaceState(null, '', '#' + p.toString().replace(/\+/g, '%20'));
 }
 
@@ -1016,21 +1123,31 @@ async function boot() {
   trails = T.trails; net = N; rides = RD.rides;
   g = buildRideGraph(trails, G.extra, G.stationLinks, net.stations.map((s) => s.ll));
   tg = buildTrainGraph(net);
+  rideStations = new Set(G.stationLinks.map((l) => l[0]));
+  for (const [s, node] of G.stationLinks) {
+    const t = g.trailOf[node];
+    if (!trailStations.has(t)) trailStations.set(t, []);
+    trailStations.get(t).push(s);
+  }
   $('builtDate').textContent = `timetable of ${N.built}`;
 
   drawNetwork();
   buildControls();
   window.trainAndTrail = { map, state, trailLines }; // handy for debugging in the console
 
-  const from = stationByName(store.get('tt.from'));
-  state.from = from >= 0 ? from : Math.max(0, stationByName(DEFAULT_FROM));
-  const to = stationByName(store.get('tt.to'));
-  state.to = to >= 0 && to !== state.from ? to : null;
-  const r = parseInt(store.get('tt.range'), 10);
-  if (r >= 0 && r < RANGES.length) state.range = r;
-  const o = parseInt(store.get('tt.out'), 10);
-  if (o >= 0 && o < OUT_BANDS.length) state.out = o;
-  readHash();
+  // A shared link wins; otherwise pick up where this device left off.
+  if (!readHash()) {
+    const st = (k) => { const i = stationByName(store.get(k)); return i >= 0 ? i : null; };
+    const start = st('tt.start');
+    state.start = start != null && rideStations.has(start) ? start : null;
+    const finish = st('tt.finish');
+    state.finish = finish != null && rideStations.has(finish) && finish !== state.start ? finish : null;
+    const trains = store.get('tt.trains') || '00';
+    if (trains[0] === '1') state.trainFrom = st('tt.from');
+    if (trains[1] === '1') state.trainTo = st('tt.to');
+    const r = parseInt(store.get('tt.range'), 10);
+    if (r >= 0 && r < RANGES.length) state.range = r;
+  }
 
   setSheet('half');
   refresh();

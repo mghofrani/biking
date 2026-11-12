@@ -112,16 +112,35 @@ select {
   cursor: pointer; font-weight: 600; font-size: 14px; font-variant-numeric: tabular-nums;
 }
 .chip small { font-weight: 500; color: var(--muted); }
-.chips.three { grid-template-columns: repeat(3, 1fr); }
-.chip.two-line { height: 50px; display: grid; align-content: center; gap: 1px; line-height: 1.15; }
-.chip.two-line small { font-size: 11.5px; }
 .chip[aria-checked="true"] { background: var(--trail); border-color: var(--trail); color: #fff; }
 .btn svg .hole { fill: var(--panel); stroke: none; }
 /* Icon-only buttons beside the station pickers keep the station names readable. */
 .row .btn { width: 44px; padding: 0; justify-content: center; flex: none; }
 .row .btn svg { width: 20px; height: 20px; }
 .row .btn-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-#pickFromBtn svg path, #pickToBtn svg path { fill: currentColor; stroke: none; }
+.pick-btn svg path { fill: currentColor; stroke: none; }
+.row .btn.remove-btn { width: 38px; color: var(--muted); }
+.row .btn.remove-btn svg { width: 16px; height: 16px; }
+
+/* Optional trains before / after the ride */
+.sub-field { margin-top: 10px; }
+.add-train {
+  margin-top: 10px; display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
+  height: 40px; padding: 0 14px; border-radius: 10px; cursor: pointer;
+  border: 1.5px dashed var(--faint); background: transparent; color: var(--ink); font: inherit; font-weight: 600; font-size: 13.5px;
+}
+.add-train:hover { border-color: var(--ink); }
+.add-train span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-train svg, .train-row label svg {
+  width: 17px; height: 17px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.train-row { margin-top: 10px; padding-left: 12px; border-left: 3px solid var(--line); }
+.field .train-row label { display: flex; align-items: center; gap: 6px; }
+.train-row label svg { width: 15px; height: 15px; }
+[hidden] { display: none !important; }
+
+.empty.intro { display: grid; gap: 8px; justify-items: center; text-align: center; padding: 20px 16px; }
+.empty.intro strong { color: var(--ink); font-size: 15px; }
 
 /* "Choose on map" mode */
 .pick-banner {

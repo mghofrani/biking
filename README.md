@@ -4,7 +4,13 @@
 
 Live site: https://mghofrani.github.io/biking/
 
-The map shows Melbourne's bike trails and the metro train network together. Pick where you're starting and where you want to finish (from the list, "near me", or by tapping the map). Then choose how far out the first train should take you (**Nearby** 4–25 min, **Suburbs** 25–45 min, **Far out** 45–80 min) and how far you want to ride. Every suggestion has the same shape: **train out → ride one or more trails → train home**. For example:
+The map shows Melbourne's bike trails and the metro train network together. Planning starts with the ride:
+
+1. **Start biking at:** choose a station next to a trail (from the list, the one nearest you, by tapping the map, or by tapping a trail or station).
+2. **Finish biking at:** choose a station, or leave it on *Suggest by distance* and pick a ride length (10–20, 20–30, 30–45 or 45–80 km) to get ride ideas from your start.
+3. **Trains, if you want them:** **Get to … by train** adds a train trip from any station to the start of the ride. **Continue by train** adds a train trip from the end of the ride to anywhere you like.
+
+For example:
 
 > Train Anzac → Hughesdale (Pakenham/Cranbourne line, 17 min) · ride 17 km on Station Trail › Gardiners Creek › Anniversary Trail › Darebin Creek Trail · train Alphington → Flinders Street (Hurstbridge line, 19 min)
 
@@ -31,7 +37,7 @@ data-raw/gtfs-metro ─┘                         ├─ data/graph.json    lin
 1. **Trail network.** Each trail from the KML is simplified and split into nodes every ≤30 m. Trails less than 25 m apart are joined at junctions, and trail ends are joined by short on-road links (≤400 m) to nearby trails. Each station connects to every trail within 1 km (counted as on-road riding).
 2. **Rides.** From every station near a trail, a shortest-path search ([js/ridegraph.js](js/ridegraph.js)) finds the route to every other such station. Road metres cost double, so routes stay on trails. Rides of 8–80 km with little road riding are saved.
 3. **Trains.** The GTFS timetable gives each line's stopping pattern and typical all-stops travel time between stations ([js/trains.js](js/trains.js)). Each change of train adds an 8-minute allowance.
-4. **Suggestions** (in the browser, [js/app.js](js/app.js)). For your start and finish stations, a ride qualifies if it's in the chosen distance band and its first train trip falls within the chosen "train out" time. Rides are then ranked with a mild preference for a shorter trip home, little road riding, and distances near the middle of each band. The top results are spread across different trails and start stations, with at most two that finish right at your destination (so most days are train → ride → train). A daily random factor means "Today's pick" changes each day, and **Shuffle** gives new ideas.
+4. **Ride ideas** (in the browser, [js/app.js](js/app.js)). With a start and no finish, every saved ride from that station in the chosen distance band is ranked. The ranking prefers little road riding and distances near the middle of the band, plus, if you've added a train afterwards, a shorter train trip from the finish. The top results are spread across different finishes and trails. With both a start and a finish, the route is worked out directly on the trail network. Trains before and after the ride are planned from the timetable. A daily random factor means "Today's pick" changes each day, and **Shuffle** gives new ideas.
 
 There is no build step and no framework: plain HTML, CSS and JavaScript modules with [Leaflet](https://leafletjs.com/), served as static files by GitHub Pages.
 
